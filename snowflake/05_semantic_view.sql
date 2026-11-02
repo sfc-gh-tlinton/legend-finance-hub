@@ -1,0 +1,287 @@
+use role __ROLE__;
+use warehouse __WAREHOUSE__;
+-- Semantic view LEGEND_FINANCE_SV (source: semantic_view.yaml)
+CALL SYSTEM$CREATE_SEMANTIC_VIEW_FROM_YAML('__DB__.FINANCE', $$
+name: LEGEND_FINANCE_SV
+description: >-
+  Legend Biotech corporate finance model (simulated data, cutoff 2026-10-27). Covers income statement actual vs budget,
+  balance sheet, general ledger journals, accounts receivable, accounts payable, month-end close tasks and exceptions,
+  Carvykti profit split with Janssen (J&J), and Snowflake FinOps consumption / chargeback by business unit.
+  Periods through 2026-09 are closed; 2026-10 close is in progress. All amounts in USD.
+tables:
+  - name: INCOME_STATEMENT
+    description: Monthly P&L actuals and budget by entity, GL account and cost center. Revenue and expenses are positive numbers.
+    base_table: {database: __DB__, schema: FINANCE, table: V_INCOME_STATEMENT}
+    dimensions:
+      - {name: PERIOD_NAME, expr: PERIOD_NAME, data_type: VARCHAR, description: "Fiscal period as YYYY-MM"}
+      - {name: FISCAL_YEAR, expr: FISCAL_YEAR, data_type: NUMBER}
+      - {name: FISCAL_QUARTER, expr: FISCAL_QUARTER, data_type: VARCHAR, sample_values: [Q1, Q2, Q3, Q4]}
+      - {name: ENTITY_ID, expr: ENTITY_ID, data_type: VARCHAR, sample_values: [US01, BE01, IE01]}
+      - {name: ENTITY_NAME, expr: ENTITY_NAME, data_type: VARCHAR}
+      - {name: ACCOUNT_ID, expr: ACCOUNT_ID, data_type: VARCHAR}
+      - {name: ACCOUNT_NAME, expr: ACCOUNT_NAME, data_type: VARCHAR, sample_values: ["Collaboration Revenue - Carvykti", "Research & Development", "Personnel Costs"]}
+      - {name: ACCOUNT_TYPE, expr: ACCOUNT_TYPE, data_type: VARCHAR, sample_values: [Revenue, COGS, OpEx, Other]}
+      - {name: CATEGORY, expr: CATEGORY, data_type: VARCHAR, description: "P&L section", sample_values: [Revenue, Cost of Revenue, Operating Expenses, "Other Income (Expense)"]}
+      - {name: COST_CENTER_ID, expr: COST_CENTER_ID, data_type: VARCHAR}
+      - {name: COST_CENTER_NAME, expr: COST_CENTER_NAME, data_type: VARCHAR}
+      - {name: BUSINESS_UNIT, expr: BUSINESS_UNIT, data_type: VARCHAR, sample_values: [Finance, "R&D", Commercial, Manufacturing, HR]}
+    time_dimensions:
+      - {name: FISCAL_PERIOD, expr: FISCAL_PERIOD, data_type: DATE, description: "First day of fiscal month"}
+    facts:
+      - {name: ACTUAL_AMOUNT, expr: ACTUAL_AMOUNT, data_type: NUMBER, description: "Actual amount, positive for both revenue and expense"}
+      - {name: BUDGET_AMOUNT, expr: BUDGET_AMOUNT, data_type: NUMBER}
+      - {name: NET_INCOME_CONTRIBUTION, expr: NET_INCOME_CONTRIBUTION, data_type: NUMBER, description: "Signed contribution to net income (revenue positive, expense negative)"}
+    metrics:
+      - {name: TOTAL_ACTUAL, expr: SUM(ACTUAL_AMOUNT), description: "Sum of actual amount; filter by CATEGORY or ACCOUNT_TYPE"}
+      - {name: TOTAL_BUDGET, expr: SUM(BUDGET_AMOUNT)}
+      - {name: BUDGET_VARIANCE, expr: SUM(ACTUAL_AMOUNT) - SUM(BUDGET_AMOUNT), description: "Actual minus budget"}
+      - {name: TOTAL_REVENUE, expr: "SUM(CASE WHEN ACCOUNT_TYPE = 'Revenue' THEN ACTUAL_AMOUNT ELSE 0 END)"}
+      - {name: OPERATING_EXPENSES, expr: "SUM(CASE WHEN ACCOUNT_TYPE = 'OpEx' THEN ACTUAL_AMOUNT ELSE 0 END)"}
+      - {name: GROSS_PROFIT, expr: "SUM(CASE WHEN ACCOUNT_TYPE IN ('Revenue','COGS') THEN NET_INCOME_CONTRIBUTION ELSE 0 END)"}
+      - {name: OPERATING_INCOME, expr: "SUM(CASE WHEN ACCOUNT_TYPE IN ('Revenue','COGS','OpEx') THEN NET_INCOME_CONTRIBUTION ELSE 0 END)"}
+      - {name: NET_INCOME, expr: SUM(NET_INCOME_CONTRIBUTION), description: "Net income = revenue - all expenses + other income"}
+    filters:
+      - {name: CLOSED_PERIODS, expr: "FISCAL_PERIOD < '2026-10-01'", description: "Only fully closed periods"}
+  - name: BALANCE_SHEET
+    description: Month-end balance by entity and balance sheet account (snapshot, do not sum across periods). Assets, liabilities and equity are positive.
+    base_table: {database: __DB__, schema: FINANCE, table: V_BALANCE_SHEET}
+    dimensions:
+      - {name: PERIOD_NAME, expr: PERIOD_NAME, data_type: VARCHAR}
+      - {name: ENTITY_ID, expr: ENTITY_ID, data_type: VARCHAR}
+      - {name: ENTITY_NAME, expr: ENTITY_NAME, data_type: VARCHAR}
+      - {name: ACCOUNT_ID, expr: ACCOUNT_ID, data_type: VARCHAR}
+      - {name: ACCOUNT_NAME, expr: ACCOUNT_NAME, data_type: VARCHAR, sample_values: ["Cash and Cash Equivalents", "Accounts Receivable", "Accounts Payable", "Retained Earnings"]}
+      - {name: ACCOUNT_TYPE, expr: ACCOUNT_TYPE, data_type: VARCHAR, sample_values: [Asset, Liability, Equity]}
+      - {name: CATEGORY, expr: CATEGORY, data_type: VARCHAR, sample_values: [Current Assets, Non-Current Assets, Current Liabilities, Equity]}
+    time_dimensions:
+      - {name: FISCAL_PERIOD, expr: FISCAL_PERIOD, data_type: DATE}
+    facts:
+      - {name: BALANCE, expr: BALANCE, data_type: NUMBER, description: "Period-end balance"}
+    metrics:
+      - {name: TOTAL_BALANCE, expr: SUM(BALANCE), description: "Sum of balances; always filter to a single FISCAL_PERIOD"}
+  - name: GL_JOURNALS
+    description: General ledger journal lines (double entry). AMOUNT = debit - credit. Use for drill-down into what drove a balance or P&L change.
+    base_table: {database: __DB__, schema: FINANCE, table: GL_JOURNAL_LINES}
+    dimensions:
+      - {name: JOURNAL_ID, expr: JOURNAL_ID, data_type: VARCHAR}
+      - {name: ENTITY_ID, expr: ENTITY_ID, data_type: VARCHAR}
+      - {name: ACCOUNT_ID, expr: ACCOUNT_ID, data_type: VARCHAR}
+      - {name: COST_CENTER_ID, expr: COST_CENTER_ID, data_type: VARCHAR}
+      - {name: SOURCE, expr: SOURCE, data_type: VARCHAR, sample_values: [AR, AP, AR_RECEIPT, AP_PAYMENT, PAYROLL, ACCRUAL, MANUAL, FX_REVAL]}
+      - {name: DOC_REF, expr: DOC_REF, data_type: VARCHAR, description: "Source document (invoice or bill id)"}
+      - {name: DESCRIPTION, expr: DESCRIPTION, data_type: VARCHAR}
+      - {name: POSTED_BY, expr: POSTED_BY, data_type: VARCHAR}
+      - {name: IS_MANUAL, expr: IS_MANUAL, data_type: BOOLEAN}
+    time_dimensions:
+      - {name: POSTING_DATE, expr: POSTING_DATE, data_type: DATE}
+      - {name: GL_FISCAL_PERIOD, expr: FISCAL_PERIOD, data_type: DATE}
+    facts:
+      - {name: DEBIT, expr: DEBIT, data_type: NUMBER}
+      - {name: CREDIT, expr: CREDIT, data_type: NUMBER}
+      - {name: GL_AMOUNT, expr: AMOUNT, data_type: NUMBER}
+    metrics:
+      - {name: TOTAL_DEBITS, expr: SUM(DEBIT)}
+      - {name: TOTAL_CREDITS, expr: SUM(CREDIT)}
+      - {name: JOURNAL_COUNT, expr: COUNT(DISTINCT JOURNAL_ID)}
+  - name: CUSTOMERS
+    description: Customers including Janssen collaboration partners, specialty distributors and CAR-T treatment centers.
+    base_table: {database: __DB__, schema: FINANCE, table: DIM_CUSTOMER}
+    primary_key: {columns: [CUSTOMER_ID]}
+    dimensions:
+      - {name: CUSTOMER_ID, expr: CUSTOMER_ID, data_type: VARCHAR}
+      - {name: CUSTOMER_NAME, expr: CUSTOMER_NAME, data_type: VARCHAR, sample_values: ["Janssen Biotech Inc.", "Janssen-Cilag International NV", "Cardinal Health Specialty"]}
+      - {name: SEGMENT, expr: SEGMENT, data_type: VARCHAR, sample_values: [Collaboration Partner, Distributor, Treatment Center, Government]}
+      - {name: REGION, expr: REGION, data_type: VARCHAR, sample_values: [US, Europe, Japan, APAC]}
+      - {name: PAYMENT_TERMS_DAYS, expr: PAYMENT_TERMS_DAYS, data_type: NUMBER}
+  - name: AR_INVOICES
+    description: Customer invoices (accounts receivable sub-ledger). STATUS Open means unpaid. As-of date 2026-10-27.
+    base_table: {database: __DB__, schema: FINANCE, table: AR_INVOICES}
+    primary_key: {columns: [INVOICE_ID]}
+    dimensions:
+      - {name: INVOICE_ID, expr: INVOICE_ID, data_type: VARCHAR}
+      - {name: AR_CUSTOMER_ID, expr: CUSTOMER_ID, data_type: VARCHAR}
+      - {name: AR_ENTITY_ID, expr: ENTITY_ID, data_type: VARCHAR}
+      - {name: AR_STATUS, expr: STATUS, data_type: VARCHAR, sample_values: [Open, Paid]}
+      - {name: AGING_BUCKET, expr: "CASE WHEN STATUS = 'Paid' THEN 'Paid' WHEN DATEDIFF(day, DUE_DATE, '2026-10-27'::date) <= 0 THEN 'Current' WHEN DATEDIFF(day, DUE_DATE, '2026-10-27'::date) <= 30 THEN '1-30' WHEN DATEDIFF(day, DUE_DATE, '2026-10-27'::date) <= 60 THEN '31-60' WHEN DATEDIFF(day, DUE_DATE, '2026-10-27'::date) <= 90 THEN '61-90' ELSE '90+' END", data_type: VARCHAR, description: "Past-due bucket as of 2026-10-27"}
+    time_dimensions:
+      - {name: INVOICE_DATE, expr: INVOICE_DATE, data_type: DATE}
+      - {name: AR_DUE_DATE, expr: DUE_DATE, data_type: DATE}
+      - {name: PAID_DATE, expr: PAID_DATE, data_type: DATE}
+    facts:
+      - {name: INVOICE_AMOUNT, expr: AMOUNT_USD, data_type: NUMBER}
+      - {name: AR_OPEN_AMOUNT, expr: AMOUNT_USD - AMOUNT_PAID, data_type: NUMBER}
+      - {name: DAYS_TO_PAY, expr: "DATEDIFF(day, INVOICE_DATE, PAID_DATE)", data_type: NUMBER}
+      - {name: DAYS_LATE, expr: "DATEDIFF(day, DUE_DATE, COALESCE(PAID_DATE, '2026-10-27'::date))", data_type: NUMBER, description: "Days paid (or still open) after due date; negative = early"}
+    metrics:
+      - {name: TOTAL_INVOICED, expr: SUM(INVOICE_AMOUNT)}
+      - {name: OPEN_AR, expr: SUM(AR_OPEN_AMOUNT), description: "Outstanding receivables"}
+      - {name: PAST_DUE_AR, expr: "SUM(CASE WHEN STATUS = 'Open' AND DUE_DATE < '2026-10-27'::date THEN AMOUNT_USD - AMOUNT_PAID ELSE 0 END)"}
+      - {name: AVG_DAYS_TO_PAY, expr: AVG(DAYS_TO_PAY)}
+      - {name: AVG_DAYS_LATE, expr: AVG(DAYS_LATE)}
+  - name: VENDORS
+    description: Suppliers including CDMOs (Lonza), CROs (ICON, IQVIA), logistics and software vendors.
+    base_table: {database: __DB__, schema: FINANCE, table: DIM_VENDOR}
+    primary_key: {columns: [VENDOR_ID]}
+    dimensions:
+      - {name: VENDOR_ID, expr: VENDOR_ID, data_type: VARCHAR}
+      - {name: VENDOR_NAME, expr: VENDOR_NAME, data_type: VARCHAR, sample_values: [Lonza Biologics, ICON plc, IQVIA, Snowflake Inc.]}
+      - {name: VENDOR_CATEGORY, expr: CATEGORY, data_type: VARCHAR, sample_values: ["Clinical Research (CRO)", "CDMO - Viral Vector", Marketing Agency]}
+  - name: AP_BILLS
+    description: Vendor bills (accounts payable sub-ledger). STATUS Open means unpaid.
+    base_table: {database: __DB__, schema: FINANCE, table: AP_BILLS}
+    primary_key: {columns: [BILL_ID]}
+    dimensions:
+      - {name: BILL_ID, expr: BILL_ID, data_type: VARCHAR}
+      - {name: VENDOR_INVOICE_NO, expr: VENDOR_INVOICE_NO, data_type: VARCHAR}
+      - {name: AP_VENDOR_ID, expr: VENDOR_ID, data_type: VARCHAR}
+      - {name: AP_ENTITY_ID, expr: ENTITY_ID, data_type: VARCHAR}
+      - {name: AP_COST_CENTER_ID, expr: COST_CENTER_ID, data_type: VARCHAR}
+      - {name: AP_ACCOUNT_ID, expr: ACCOUNT_ID, data_type: VARCHAR}
+      - {name: AP_STATUS, expr: STATUS, data_type: VARCHAR, sample_values: [Open, Paid, Void]}
+    time_dimensions:
+      - {name: BILL_DATE, expr: BILL_DATE, data_type: DATE}
+      - {name: AP_DUE_DATE, expr: DUE_DATE, data_type: DATE}
+    facts:
+      - {name: BILL_AMOUNT, expr: AMOUNT_USD, data_type: NUMBER}
+      - {name: AP_OPEN_AMOUNT, expr: "IFF(STATUS = 'Void', 0, AMOUNT_USD - AMOUNT_PAID)", data_type: NUMBER, description: "Unpaid amount; voided duplicate bills count as zero"}
+    metrics:
+      - {name: TOTAL_BILLED, expr: SUM(BILL_AMOUNT), description: "Vendor spend"}
+      - {name: OPEN_AP, expr: SUM(AP_OPEN_AMOUNT)}
+      - {name: AP_DUE_NEXT_30_DAYS, expr: "SUM(CASE WHEN STATUS = 'Open' AND DUE_DATE <= '2026-11-26'::date THEN AMOUNT_USD - AMOUNT_PAID ELSE 0 END)"}
+  - name: CLOSE_TASKS
+    description: Month-end close checklist by period (21 tasks per period). Shows status, owner, automation and business day completed.
+    base_table: {database: __DB__, schema: FINANCE, table: CLOSE_TASKS}
+    dimensions:
+      - {name: TASK_CODE, expr: TASK_CODE, data_type: VARCHAR}
+      - {name: TASK_NAME, expr: TASK_NAME, data_type: VARCHAR}
+      - {name: TASK_CATEGORY, expr: CATEGORY, data_type: VARCHAR, sample_values: [AR, AP, Accruals, Revenue, Review, Reporting, Sign-off]}
+      - {name: OWNER, expr: OWNER, data_type: VARCHAR}
+      - {name: AUTOMATION_STATUS, expr: AUTOMATION_STATUS, data_type: VARCHAR, sample_values: [Automated, "Manual (Excel)", Manual]}
+      - {name: TASK_STATUS, expr: STATUS, data_type: VARCHAR, sample_values: [Complete, In Progress, Not Started]}
+    time_dimensions:
+      - {name: CLOSE_PERIOD, expr: FISCAL_PERIOD, data_type: DATE}
+    facts:
+      - {name: EFFORT_HOURS, expr: EFFORT_HOURS, data_type: NUMBER}
+      - {name: COMPLETED_BD, expr: COMPLETED_BD, data_type: NUMBER, description: "Business day of close on which the task was completed"}
+    metrics:
+      - {name: TASK_COUNT, expr: COUNT(*)}
+      - {name: TOTAL_EFFORT_HOURS, expr: SUM(EFFORT_HOURS)}
+      - {name: PCT_COMPLETE, expr: "AVG(CASE WHEN STATUS = 'Complete' THEN 1 ELSE 0 END)"}
+  - name: CLOSE_PERIODS
+    description: One row per fiscal month with close status, business days to close and close method (Excel vs Snowflake automated).
+    base_table: {database: __DB__, schema: FINANCE, table: CLOSE_PERIODS}
+    dimensions:
+      - {name: CLOSE_PERIOD_NAME, expr: PERIOD_NAME, data_type: VARCHAR}
+      - {name: CLOSE_STATUS, expr: STATUS, data_type: VARCHAR, sample_values: [Closed, In Progress]}
+      - {name: CLOSE_METHOD, expr: CLOSE_METHOD, data_type: VARCHAR, sample_values: ["Excel / pivot tables", "Hybrid (Excel + Snowflake)", "Snowflake automated"]}
+    time_dimensions:
+      - {name: CLOSE_PERIOD_START, expr: FISCAL_PERIOD, data_type: DATE}
+    facts:
+      - {name: BUSINESS_DAYS_TO_CLOSE, expr: BUSINESS_DAYS_TO_CLOSE, data_type: NUMBER}
+    metrics:
+      - {name: AVG_DAYS_TO_CLOSE, expr: AVG(BUSINESS_DAYS_TO_CLOSE)}
+  - name: CLOSE_EXCEPTIONS
+    description: Open October 2026 close issues raised by the CLOSE_CHECK_RULES (unposted invoices, recon breaks, duplicate bills, past-due AR, unusual manual journals, preliminary profit split, P&L flux). Each has an owner, SLA due date and workflow status.
+    base_table: {database: __DB__, schema: FINANCE, table: V_CLOSE_EXCEPTIONS}
+    dimensions:
+      - {name: EXCEPTION_TYPE, expr: EXCEPTION_TYPE, data_type: VARCHAR}
+      - {name: EXCEPTION_TASK_CODE, expr: TASK_CODE, data_type: VARCHAR}
+      - {name: REFERENCE, expr: REFERENCE, data_type: VARCHAR}
+      - {name: COUNTERPARTY, expr: COUNTERPARTY, data_type: VARCHAR}
+      - {name: SEVERITY, expr: SEVERITY, data_type: VARCHAR, sample_values: [High, Medium]}
+      - {name: DETAIL, expr: DETAIL, data_type: VARCHAR}
+      - {name: ISSUE_STATUS, expr: STATUS, data_type: VARCHAR, description: "Workflow status", sample_values: [Open, Pending Approval]}
+      - {name: ISSUE_OWNER, expr: OWNER, data_type: VARCHAR, description: "Close owner responsible for the fix", sample_values: [J.CHEN, A.PATEL, R.KUMAR, M.ORTIZ, HAREESH, S.WONG]}
+    time_dimensions:
+      - {name: SLA_DUE, expr: SLA_DUE, data_type: DATE, description: "Date the issue must be resolved by (close calendar business day)"}
+    facts:
+      - {name: EXCEPTION_AMOUNT, expr: AMOUNT, data_type: NUMBER}
+    metrics:
+      - {name: EXCEPTION_COUNT, expr: COUNT(*)}
+      - {name: EXCEPTION_TOTAL, expr: SUM(EXCEPTION_AMOUNT)}
+  - name: GL_ANOMALIES
+    description: P&L account / cost center months whose amount deviates 3+ standard deviations from the trailing 12-month average.
+    base_table: {database: __DB__, schema: FINANCE, table: V_GL_ANOMALIES}
+    dimensions:
+      - {name: ANOMALY_ACCOUNT_NAME, expr: ACCOUNT_NAME, data_type: VARCHAR}
+      - {name: ANOMALY_ENTITY_ID, expr: ENTITY_ID, data_type: VARCHAR}
+      - {name: ANOMALY_BUSINESS_UNIT, expr: BUSINESS_UNIT, data_type: VARCHAR}
+    time_dimensions:
+      - {name: ANOMALY_PERIOD, expr: FISCAL_PERIOD, data_type: DATE}
+    facts:
+      - {name: ANOMALY_ACTUAL, expr: ACTUAL_AMOUNT, data_type: NUMBER}
+      - {name: TRAILING_AVG, expr: TRAILING_AVG, data_type: NUMBER}
+      - {name: Z_SCORE, expr: Z_SCORE, data_type: NUMBER}
+  - name: PROFIT_SPLIT
+    description: Carvykti (cilta-cel) collaboration profit split with Janssen by region and month. Legend share is 50% of pre-tax profit (ex Greater China).
+    base_table: {database: __DB__, schema: FINANCE, table: PROFIT_SPLIT}
+    dimensions:
+      - {name: PS_REGION, expr: REGION, data_type: VARCHAR, sample_values: [United States, Europe, Rest of World]}
+      - {name: PS_STATUS, expr: STATUS, data_type: VARCHAR, sample_values: [Final, Preliminary]}
+      - {name: SOURCE_FILE, expr: SOURCE_FILE, data_type: VARCHAR}
+    time_dimensions:
+      - {name: PS_PERIOD, expr: FISCAL_PERIOD, data_type: DATE}
+    facts:
+      - {name: CARVYKTI_NET_SALES, expr: CARVYKTI_NET_SALES, data_type: NUMBER}
+      - {name: PS_COST_OF_GOODS, expr: COST_OF_GOODS, data_type: NUMBER}
+      - {name: PS_COMMERCIAL_EXPENSES, expr: COMMERCIAL_EXPENSES, data_type: NUMBER}
+      - {name: PS_MEDICAL_AFFAIRS, expr: MEDICAL_AFFAIRS_EXPENSES, data_type: NUMBER}
+      - {name: PRETAX_PROFIT, expr: PRETAX_PROFIT, data_type: NUMBER}
+      - {name: LEGEND_PROFIT_SHARE, expr: LEGEND_PROFIT_SHARE, data_type: NUMBER}
+      - {name: JANSSEN_PROFIT_SHARE, expr: JANSSEN_PROFIT_SHARE, data_type: NUMBER}
+    metrics:
+      - {name: TOTAL_CARVYKTI_SALES, expr: SUM(CARVYKTI_NET_SALES)}
+      - {name: TOTAL_LEGEND_SHARE, expr: SUM(LEGEND_PROFIT_SHARE)}
+      - {name: PROFIT_MARGIN, expr: "SUM(PRETAX_PROFIT) / NULLIF(SUM(CARVYKTI_NET_SALES), 0)"}
+  - name: FINOPS
+    description: Monthly Snowflake credit consumption and cost by account (GXP, non-GXP, reader), warehouse, business unit and project for chargeback. Untagged = no cost-center tag.
+    base_table: {database: __DB__, schema: FINANCE, table: V_FINOPS_MONTHLY}
+    dimensions:
+      - {name: SF_ACCOUNT_NAME, expr: ACCOUNT_NAME, data_type: VARCHAR, sample_values: [LEGEND_GXP_PROD, LEGEND_NONGXP_PROD, LEGEND_READER_BE]}
+      - {name: WAREHOUSE_NAME, expr: WAREHOUSE_NAME, data_type: VARCHAR}
+      - {name: FINOPS_BUSINESS_UNIT, expr: BUSINESS_UNIT, data_type: VARCHAR, sample_values: [Finance, "R&D", Commercial, Untagged]}
+      - {name: PROJECT, expr: PROJECT, data_type: VARCHAR, sample_values: [Month-End Close Automation, Profit Split, SAP Ingestion Pipeline]}
+      - {name: IS_TAGGED, expr: IS_TAGGED, data_type: BOOLEAN}
+    time_dimensions:
+      - {name: USAGE_MONTH, expr: FISCAL_PERIOD, data_type: DATE}
+    facts:
+      - {name: CREDITS_USED, expr: CREDITS_USED, data_type: NUMBER}
+      - {name: SNOWFLAKE_COST_USD, expr: COST_USD, data_type: NUMBER}
+    metrics:
+      - {name: TOTAL_CREDITS, expr: SUM(CREDITS_USED)}
+      - {name: TOTAL_SNOWFLAKE_COST, expr: SUM(SNOWFLAKE_COST_USD)}
+      - {name: UNTAGGED_COST, expr: "SUM(CASE WHEN NOT IS_TAGGED THEN COST_USD ELSE 0 END)"}
+relationships:
+  - name: AR_TO_CUSTOMER
+    left_table: AR_INVOICES
+    right_table: CUSTOMERS
+    relationship_columns: [{left_column: AR_CUSTOMER_ID, right_column: CUSTOMER_ID}]
+    join_type: left_outer
+    relationship_type: many_to_one
+  - name: AP_TO_VENDOR
+    left_table: AP_BILLS
+    right_table: VENDORS
+    relationship_columns: [{left_column: AP_VENDOR_ID, right_column: VENDOR_ID}]
+    join_type: left_outer
+    relationship_type: many_to_one
+verified_queries:
+  - name: net_income_by_month_2026
+    question: What was net income by month in 2026?
+    sql: SELECT period_name, SUM(net_income_contribution) AS net_income FROM __income_statement WHERE fiscal_year = 2026 AND fiscal_period < '2026-10-01' GROUP BY period_name ORDER BY period_name
+    use_as_onboarding_question: true
+  - name: rd_sep_vs_budget
+    question: Why was R&D over budget in September 2026? Which vendors drove it?
+    sql: SELECT v.vendor_name, SUM(b.bill_amount) AS spend FROM __ap_bills AS b LEFT JOIN __vendors AS v ON b.ap_vendor_id = v.vendor_id WHERE b.ap_cost_center_id = 'CC200' AND b.bill_date BETWEEN '2026-09-01' AND '2026-09-30' GROUP BY v.vendor_name ORDER BY spend DESC
+    use_as_onboarding_question: true
+  - name: ar_aging_by_customer
+    question: Show open AR by customer and aging bucket
+    sql: SELECT c.customer_name, a.aging_bucket, SUM(a.ar_open_amount) AS open_ar FROM __ar_invoices AS a LEFT JOIN __customers AS c ON a.ar_customer_id = c.customer_id WHERE a.ar_status = 'Open' GROUP BY c.customer_name, a.aging_bucket ORDER BY open_ar DESC
+    use_as_onboarding_question: true
+  - name: close_exceptions
+    question: What exceptions are blocking the October close?
+    sql: SELECT exception_type, reference, counterparty, exception_amount, severity, issue_owner, issue_status, sla_due, detail FROM __close_exceptions ORDER BY severity, exception_amount DESC
+    use_as_onboarding_question: true
+  - name: finops_by_bu
+    question: What was Snowflake spend by business unit last month?
+    sql: SELECT finops_business_unit, SUM(snowflake_cost_usd) AS cost FROM __finops WHERE usage_month = '2026-09-01' GROUP BY finops_business_unit ORDER BY cost DESC
+$$, FALSE);

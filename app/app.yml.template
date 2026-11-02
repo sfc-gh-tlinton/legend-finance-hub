@@ -1,0 +1,33 @@
+version: 2
+
+name: LEGEND_FINANCE_HUB
+database: __DB__
+schema: APPS
+query_warehouse: __WAREHOUSE__
+
+label: "Legend Finance Hub"
+description: "Legend Biotech finance: P&L, balance sheet, AR/AP, agentic month-end close, Carvykti profit split, FinOps chargeback and a finance assistant."
+icon: "public/icon.svg"
+
+install:
+  commands:
+    - ["npm", "ci", "--include=dev"]
+
+build:
+  commands:
+    - ["npm", "run", "build"]
+    - ["cp", "-r", ".next/static", ".next/standalone/.next/static"]
+    - ["cp", "-r", "public", ".next/standalone/public"]
+    - ["rm", "-rf", "node_modules"]
+
+run:
+  command: ["node", ".next/standalone/server.js"]
+
+ignore:
+  - node_modules
+  - .env*
+  - __pycache__
+  - "*.pyc"
+  - .next
+  - .git
+  - snowflake.log
